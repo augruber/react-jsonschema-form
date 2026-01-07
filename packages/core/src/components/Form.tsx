@@ -365,6 +365,11 @@ export default class Form<
    */
   pendingChanges: PendingChange<T>[] = [];
 
+  /** Flag to track when we're in the middle of processing a user-initiated field change.
+   * This is used to prevent componentDidUpdate from reverting anyOf/oneOf field changes.
+   */
+  private _isProcessingUserChange = false;
+
   /** Constructs the `Form` from the `props`. Will setup the initial state from the props. It will also call the
    * `onChange` handler if the initially provided `formData` is modified to add missing default values as part of the
    * state construction.
@@ -459,11 +464,22 @@ export default class Form<
   ) {
     if (snapshot.shouldUpdate) {
       const { nextState } = snapshot;
-      if (
-        !deepEquals(nextState.formData, this.props.formData) &&
-        !deepEquals(nextState.formData, prevState.formData) &&
-        this.props.onChange
-      ) {
+
+      // Prevent anyOf/oneOf field changes from reverting when getStateFromProps
+      // re-evaluates and produces stale formData. Skip update if we're processing
+      // a user change and nextState differs from props (user's change already applied).
+      const nextStateDiffersFromProps = !deepEquals(nextState.formData, this.props.formData);
+      const wasProcessingUserChange = this._isProcessingUserChange;
+
+      // Clear the flag now that we've captured it
+      this._isProcessingUserChange = false;
+
+      if (wasProcessingUserChange && nextStateDiffersFromProps) {
+        // Skip this update - the user's change is already applied via processPendingChange
+        return;
+      }
+
+      if (nextStateDiffersFromProps && !deepEquals(nextState.formData, prevState.formData) && this.props.onChange) {
         this.props.onChange(toIChangeEvent(nextState));
       }
       this.setState(nextState);
@@ -868,6 +884,9 @@ export default class Form<
     if (this.pendingChanges.length === 0) {
       return;
     }
+    // Mark that we're processing a user-initiated change.
+    // This flag is checked in componentDidUpdate to prevent reverting user changes.
+    this._isProcessingUserChange = true;
     const { newValue, path, id } = this.pendingChanges[0];
     const { newErrorSchema } = this.pendingChanges[0];
     const { extraErrors, omitExtraData, liveOmit, noValidate, liveValidate, onChange } = this.props;
@@ -878,6 +897,16 @@ export default class Form<
     const isRootPath = !path || path.length === 0 || (path.length === 1 && path[0] === rootPathId);
     let retrievedSchema = this.state.retrievedSchema;
     let formData = isRootPath ? newValue : _cloneDeep(oldFormData);
+
+    // When formData has only undefined values (e.g., {types: undefined, content: undefined}),
+    // pass undefined to getStateFromProps to trigger fresh default computation.
+    // This happens when switching from null to an object option in oneOf - MultiSchemaField
+    // sends an object with property names but undefined values.
+    const hasOnlyUndefinedValues =
+      isObject(formData) &&
+      Object.keys(formData as object).length > 0 &&
+      Object.values(formData as object).every((v) => v === undefined);
+    const inputForDefaults = hasOnlyUndefinedValues ? undefined : formData;
     if (isObject(formData) || Array.isArray(formData)) {
       if (newValue === ADDITIONAL_PROPERTY_KEY_REMOVE) {
         // For additional properties, we were given the special remove this key value, so unset it
@@ -887,8 +916,12 @@ export default class Form<
         _set(formData, path, newValue);
       }
       // Pass true to skip live validation in `getStateFromProps()` since we will do it a bit later
-      const newState = this.getStateFromProps(this.props, formData, undefined, undefined, undefined, true);
-      formData = newState.formData;
+      const newState = this.getStateFromProps(this.props, inputForDefaults, undefined, undefined, undefined, true);
+      // Merge newState.formData into formData, preserving user's changes but adding new fields
+      // (dependency defaults). getStateFromProps can incorrectly revert anyOf/oneOf changes.
+      if (newState.formData !== undefined) {
+        formData = this.mergeFormDataPreservingUserChanges(formData, newState.formData);
+      }
       retrievedSchema = newState.retrievedSchema;
     }
 
@@ -976,6 +1009,51 @@ export default class Form<
   private updateRetrievedSchema(retrievedSchema: S) {
     const isTheSame = deepEquals(retrievedSchema, this.state?.retrievedSchema);
     return isTheSame ? this.state.retrievedSchema : retrievedSchema;
+  }
+
+  /**
+   * Merges computed formData into existing formData, preserving user's changes.
+   * - Keeps all existing fields (these contain the user's changes)
+   * - Adds new fields from computed (these are dependency defaults, etc.)
+   * - Recursively merges nested objects
+   *
+   * This prevents anyOf/oneOf re-evaluation from reverting user changes while still
+   * allowing dependency defaults to be applied for newly-added fields.
+   *
+   * @param existing - The formData with user's changes already applied
+   * @param computed - The formData computed by getStateFromProps (may have reverted changes but also has dependency defaults)
+   * @returns Merged formData preserving user changes but adding new fields
+   */
+  private mergeFormDataPreservingUserChanges<D>(existing: D, computed: D): D {
+    // If existing is null/undefined, use computed (applying defaults for new option)
+    if (existing === null || existing === undefined) {
+      return computed;
+    }
+    // If existing is not an object, keep it (user selected a primitive)
+    if (!isObject(existing)) {
+      return existing;
+    }
+    // If computed is not an object, keep existing
+    if (!isObject(computed)) {
+      return existing;
+    }
+
+    // Both are objects - merge recursively
+    const result = { ...existing } as GenericObjectType;
+    const computedObj = computed as GenericObjectType;
+
+    for (const key of Object.keys(computedObj)) {
+      if (!(key in result) || result[key] === undefined) {
+        // New field or undefined value - use computed (handles dependency defaults and null→object transitions)
+        result[key] = computedObj[key];
+      } else if (isObject(result[key]) && isObject(computedObj[key])) {
+        // Both are objects - recursively merge
+        result[key] = this.mergeFormDataPreservingUserChanges(result[key], computedObj[key]);
+      }
+      // Otherwise keep existing value (preserves user's change)
+    }
+
+    return result as D;
   }
 
   /**
